@@ -1,6 +1,5 @@
 #!/usr/local/bin/python3
 
-import abc
 import argparse
 import datetime
 import json
@@ -9,27 +8,31 @@ import sys
 
 import bugzilla
 
+import formats
+
 DEFAULT_BZ_URL = "https://bugzilla.redhat.com/xmlrpc.cgi"
-SHALE_RE = re.compile(r"^.*shale:\"(?P<shale>{[^\r\n]*})\"")
+SHALE_RE = re.compile(r"^.*shale:\"?(?P<shale>{[^\r\n]*})")
 
 QUERY = {
-    'bug_status': '__open__',
+#    'bug_status': '__open__',
     'chfield': '[Bug creation]',
     'chfieldfrom': '2020-12-01',
     'chfieldto': '2020-12-08',
     'f1': 'cf_internal_whiteboard',
-    'list_id': '11597024',
     'o1': 'substring',
     'product': 'Red Hat OpenStack',
     'query_format': 'advanced',
-    'v1': 'Squad:OVN',
     "include_fields": [
-        "id", "summary", "reporter", "qa_contact", "external_bugs"],
-
+        "id", "summary", "reporter", "qa_contact", "external_bugs",
+        "cf_devel_whiteboard"],
 }
 
 
+
 class Bug:
+    QE_TEAM = (
+        "ekuris@redhat.com", "eolivare@redhat.com", "rsafrano@redhat.com")
+
     def __init__(self, bug):
         self._bug = bug
         self._customer_tickets = None
@@ -52,8 +55,11 @@ class Bug:
         if self._shale is None:
             match = SHALE_RE.match(self._bug.devel_whiteboard)
             if match:
-                self._shale = json.loads(
-                    match.group("shale").replace("'", '"'))
+                try:
+                    self._shale = json.loads(
+                        match.group("shale").replace("'", '"'))
+                except json.decoder.JSONDecodeError:
+                    self._shale = {}
             else:
                 self._shale = {}
         return self._shale
@@ -61,6 +67,10 @@ class Bug:
     @property
     def was_escalated(self):
         return self.shale.get('escalated', 'no') == 'yes'
+
+    @property
+    def is_reported_by_qe(self):
+        return self.qa_contact in self.QE_TEAM
 
     def __getattr__(self, name):
         return getattr(self._bug, name)
@@ -70,58 +80,6 @@ class Bug:
 
     def __str__(self):
         return self._bug.__str__()
-
-
-class Result(metaclass=abc.ABCMeta):
-    @abc.abstractmethod
-    def __init__(self, field_names):
-        pass
-
-    @abc.abstractmethod
-    def add_row(self, row):
-        pass
-
-    @abc.abstractmethod
-    def print(self):
-        pass
-
-
-class CSVResult(Result):
-    def __init__(self, field_names):
-        import csv
-        import io
-
-        self._field_names = field_names
-        self._buffer = io.StringIO()
-        self._writer = csv.DictWriter(
-            self._buffer, fieldnames=self._field_names)
-
-    def add_row(self, row):
-        self._writer.writerow(
-            {name: value for name, value in zip(self._field_names, row)})
-
-    def print(self):
-        print(self._buffer.getvalue())
-
-
-class TableResult(Result):
-
-    def __init__(self, field_names):
-        import prettytable
-
-        self._table = prettytable.PrettyTable(field_names=field_names)
-
-    def add_row(self, row):
-        self._table.add_row(row)
-
-    def print(self):
-        print(self._table)
-
-
-RESULT_FORMAT_CLASS = {
-    "csv": CSVResult,
-    "table": TableResult,
-}
 
 
 def get_opts():
@@ -139,20 +97,39 @@ def get_opts():
     parser.add_argument(
         '-f', "--format", help="Output format", choices=["csv", "table"],
         default="table")
+    parser.add_argument(
+        '--squad', help="The Network squad", type=str, default="OVN")
     return parser.parse_args()
 
 
+def process_bugs(start_date, result, bugs):
+    date = "%s" % start_date.date()
+    qe_bugs = 0
+    customer_bugs = 0
+    escalated_bugs = 0
+
+    for bug in bugs:
+        if bug.is_reported_by_qe:
+            qe_bugs += 1
+        if bug.has_customer_ticket:
+            customer_bugs += 1
+        if bug.was_escalated:
+            escalated_bugs += 1
+
+    result.add_row([date, len(bugs), qe_bugs, customer_bugs, escalated_bugs])
+
 def main():
     args = get_opts()
-    result = RESULT_FORMAT_CLASS[args.format](
+    result = formats.get(args.format)(
         field_names=[
             "Week",
             "Bugs reported",
-#            "Customer bugs",
-#            "QE bugs",
-#            "Bugs triaged",
-#            "Bugs closed",
+            "QE reported",
+            "Customer bugs",
+            "Escalated bugs",
         ])
+
+    QUERY['v1'] = "Squad:%s" % args.squad
 
     try:
         bzapi = bugzilla.Bugzilla(args.url, api_key=args.apikey)
@@ -160,11 +137,10 @@ def main():
         print(e)
         sys.exit(1)
 
-    bzapi.bug_autorefresh = True
+    #bzapi.bug_autorefresh = True
 
     start_date = datetime.datetime.strptime(args.startdate, '%Y-%m-%d')
 
-    import ipdb; ipdb.set_trace()
     for i in range(args.weeks):
         end_date = start_date + datetime.timedelta(weeks=1)
         query = QUERY.copy()
@@ -173,7 +149,7 @@ def main():
             'chfieldto': str(end_date.date())})
 
         bugs = [Bug(bug) for bug in bzapi.query(query)]
-        result.add_row(["%s" % start_date.date(), len(bugs)])
+        process_bugs(start_date, result, bugs)
         start_date = end_date
 
     result.print()
