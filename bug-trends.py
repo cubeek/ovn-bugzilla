@@ -9,7 +9,9 @@ import sys
 import bugzilla
 
 import formats
+import ldapquery
 
+DEFAULT_LDAP_SERVER = "ldap://ldap.corp.redhat.com"
 DEFAULT_BZ_URL = "https://bugzilla.redhat.com/xmlrpc.cgi"
 SHALE_RE = re.compile(r"^.*shale:\"?(?P<shale>{[^\r\n]*})")
 
@@ -23,16 +25,12 @@ QUERY = {
     'product': 'Red Hat OpenStack',
     'query_format': 'advanced',
     "include_fields": [
-        "id", "summary", "reporter", "qa_contact", "external_bugs",
+        "id", "summary", "creator", "external_bugs",
         "cf_devel_whiteboard"],
 }
 
 
-
 class Bug:
-    QE_TEAM = (
-        "ekuris@redhat.com", "eolivare@redhat.com", "rsafrano@redhat.com")
-
     def __init__(self, bug):
         self._bug = bug
         self._customer_tickets = None
@@ -45,10 +43,6 @@ class Bug:
                 ticket for ticket in self._bug.external_bugs
                 if ticket['type']['type'] == 'SFDC']
         return self._customer_tickets
-
-    @property
-    def has_customer_ticket(self):
-        return bool(self.customer_tickets)
 
     @property
     def shale(self):
@@ -69,8 +63,13 @@ class Bug:
         return self.shale.get('escalated', 'no') == 'yes'
 
     @property
-    def is_reported_by_qe(self):
-        return self.qa_contact in self.QE_TEAM
+    def reported_by(self):
+        querier = ldapquery.LdapQuerier.get_instance()
+
+        try:
+            return querier.get_role(self.creator)
+        except AttributeError as e:
+            import ipdb; ipdb.set_trace()
 
     def __getattr__(self, name):
         return getattr(self._bug, name)
@@ -104,19 +103,31 @@ def get_opts():
 
 def process_bugs(start_date, result, bugs):
     date = "%s" % start_date.date()
-    qe_bugs = 0
-    customer_bugs = 0
-    escalated_bugs = 0
+    escalated = 0
+    reporters = {
+        ldapquery.QA: 0,
+        ldapquery.DEV: 0,
+        ldapquery.CEE: 0,
+        ldapquery.UNKNOWN_RH: 0,
+        ldapquery.NON_RH: 0,
+        ldapquery.EX_RH: 0,
+    }
 
     for bug in bugs:
-        if bug.is_reported_by_qe:
-            qe_bugs += 1
-        if bug.has_customer_ticket:
-            customer_bugs += 1
+        reporters[bug.reported_by] += 1
         if bug.was_escalated:
-            escalated_bugs += 1
+            escalated += 1
+    result.add_row(
+        [date, len(bugs),
+         reporters[ldapquery.DEV],
+         reporters[ldapquery.QA],
+         reporters[ldapquery.CEE],
+         reporters[ldapquery.UNKNOWN_RH],
+         reporters[ldapquery.EX_RH],
+         reporters[ldapquery.NON_RH],
+         escalated,
+    ])
 
-    result.add_row([date, len(bugs), qe_bugs, customer_bugs, escalated_bugs])
 
 def main():
     args = get_opts()
@@ -124,12 +135,20 @@ def main():
         field_names=[
             "Week",
             "Bugs reported",
+            "Dev reported",
             "QE reported",
-            "Customer bugs",
+            "Support bugs",
+            "Other RH",
+            "Ex-RH",
+            "Out of RH",
             "Escalated bugs",
         ])
 
     QUERY['v1'] = "Squad:%s" % args.squad
+
+    # initalize LDAP
+    querier = ldapquery.LdapQuerier(DEFAULT_LDAP_SERVER)
+    querier.connect()
 
     try:
         bzapi = bugzilla.Bugzilla(args.url, api_key=args.apikey)
