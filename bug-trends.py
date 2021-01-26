@@ -25,8 +25,8 @@ QUERY = {
     'product': 'Red Hat OpenStack',
     'query_format': 'advanced',
     "include_fields": [
-        "id", "summary", "creator", "external_bugs",
-        "cf_devel_whiteboard"],
+        "id", "summary", "component", "creator", "external_bugs",
+        "cf_devel_whiteboard", "product", "creation_time"],
 }
 
 
@@ -35,6 +35,7 @@ class Bug:
         self._bug = bug
         self._customer_tickets = None
         self._shale = None
+        self._creation_time = None
 
     @property
     def customer_tickets(self):
@@ -71,6 +72,13 @@ class Bug:
         except AttributeError as e:
             import ipdb; ipdb.set_trace()
 
+    @property
+    def creation_time(self):
+        if not self._creation_time:
+            self._creation_time = datetime.datetime.strptime(
+                self._bug.creation_time.value, "%Y%m%dT%H:%M:%S")
+        return self._creation_time
+
     def __getattr__(self, name):
         return getattr(self._bug, name)
 
@@ -94,15 +102,14 @@ def get_opts():
     parser.add_argument(
         '-w', "--weeks", help="How many weeks to show", type=int, default=1)
     parser.add_argument(
-        '-f', "--format", help="Output format", choices=["csv", "table"],
-        default="table")
+        '-f', "--format", help="Output format",
+        choices=["csv", "table", "json"], default="table")
     parser.add_argument(
         '--squad', help="The Network squad", type=str, default="OVN")
     return parser.parse_args()
 
 
-def process_bugs(start_date, result, bugs):
-    date = "%s" % start_date.date()
+def process_by_reporter(result, date, bug_list):
     escalated = 0
     reporters = {
         ldapquery.QA: 0,
@@ -113,12 +120,12 @@ def process_bugs(start_date, result, bugs):
         ldapquery.EX_RH: 0,
     }
 
-    for bug in bugs:
+    for bug in bug_list:
         reporters[bug.reported_by] += 1
         if bug.was_escalated:
             escalated += 1
     result.add_row(
-        [date, len(bugs),
+        [date, len(bug_list),
          reporters[ldapquery.DEV],
          reporters[ldapquery.QA],
          reporters[ldapquery.CEE],
@@ -129,9 +136,9 @@ def process_bugs(start_date, result, bugs):
     ])
 
 
-def main():
-    args = get_opts()
-    result = formats.get(args.format)(
+def process_bugs(format_, bugs):
+    by_reporter = formats.get(format_)(
+        name='By Reporter',
         field_names=[
             "Week",
             "Bugs reported",
@@ -143,6 +150,27 @@ def main():
             "Out of RH",
             "Escalated bugs",
         ])
+
+    for date, bug_list in sorted(bugs.items(), key=lambda x: x[0]):
+        process_by_reporter(by_reporter, date, bug_list)
+
+    return [by_reporter]
+
+
+def create_bugs_based_on_report_date(bugs):
+    bug_dates = {}
+    for bug in bugs:
+        bug = Bug(bug)
+        monday_date = (
+            bug.creation_time - datetime.timedelta(
+                days=bug.creation_time.weekday()))
+        bug_dates.setdefault(monday_date.strftime("%Y-%m-%d"), []).append(bug)
+
+    return bug_dates
+
+
+def main():
+    args = get_opts()
 
     QUERY['v1'] = "Squad:%s" % args.squad
 
@@ -159,19 +187,19 @@ def main():
     #bzapi.bug_autorefresh = True
 
     start_date = datetime.datetime.strptime(args.startdate, '%Y-%m-%d')
+    end_date = start_date + datetime.timedelta(weeks=args.weeks)
 
-    for i in range(args.weeks):
-        end_date = start_date + datetime.timedelta(weeks=1)
-        query = QUERY.copy()
-        query.update({
-            'chfieldfrom': str(start_date.date()),
-            'chfieldto': str(end_date.date())})
+    query = QUERY.copy()
+    query.update({
+        'chfieldfrom': str(start_date.date()),
+        'chfieldto': str(end_date.date())})
 
-        bugs = [Bug(bug) for bug in bzapi.query(query)]
-        process_bugs(start_date, result, bugs)
-        start_date = end_date
+    bugs = create_bugs_based_on_report_date(bzapi.query(query))
 
-    result.print()
+    reports = process_bugs(args.format, bugs)
+
+    for report in reports:
+        report.print()
 
 
 if __name__ == "__main__":
