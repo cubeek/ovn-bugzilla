@@ -5,18 +5,20 @@ import datetime
 import json
 import re
 import sys
+import time
 
 import bugzilla
 
 import formats
 import ldapquery
 
+BUG_STATES = ('assigned', 'triaged', 'on_dev', 'post', 'modified', 'on_qa',
+              'verified', 'release_pending', 'closed')
 DEFAULT_LDAP_SERVER = "ldap://ldap.corp.redhat.com"
 DEFAULT_BZ_URL = "https://bugzilla.redhat.com/xmlrpc.cgi"
 SHALE_RE = re.compile(r"^.*shale:\"?(?P<shale>{[^\r\n]*})")
-
 QUERY = {
-#    'bug_status': '__open__',
+    # 'bug_status': '__open__',
     'chfield': '[Bug creation]',
     'chfieldfrom': '2020-12-01',
     'chfieldto': '2020-12-08',
@@ -28,6 +30,7 @@ QUERY = {
         "id", "summary", "component", "creator", "external_bugs",
         "cf_devel_whiteboard", "product", "creation_time"],
 }
+SEC_PER_DAY = 86400
 
 
 class Bug:
@@ -70,7 +73,8 @@ class Bug:
         try:
             return querier.get_role(self.creator)
         except AttributeError as e:
-            import ipdb; ipdb.set_trace()
+            # import ipdb; ipdb.set_trace()
+            print(e)
 
     @property
     def creation_time(self):
@@ -94,7 +98,7 @@ def get_opts():
     parser.add_argument(
         '-k', "--apikey", help="The Bugzilla API key", type=str, required=True)
     parser.add_argument(
-        '-u', "--url", help="The Bugzilla XMLRPC API URL", type=str, 
+        '-u', "--url", help="The Bugzilla XMLRPC API URL", type=str,
         default=DEFAULT_BZ_URL)
     parser.add_argument(
         '-s', "--startdate", help="Starting date", type=str,
@@ -106,6 +110,9 @@ def get_opts():
         choices=["csv", "table", "json"], default="table")
     parser.add_argument(
         '--squad', help="The Network squad", type=str, default="OVN")
+    parser.add_argument(
+        '-bz', "--bugzilla", help="The ID of a BZ bug", type=str)
+
     return parser.parse_args()
 
 
@@ -132,8 +139,7 @@ def process_by_reporter(result, date, bug_list):
          reporters[ldapquery.UNKNOWN_RH],
          reporters[ldapquery.EX_RH],
          reporters[ldapquery.NON_RH],
-         escalated,
-    ])
+         escalated])
 
 
 def process_bugs(format_, bugs):
@@ -169,6 +175,30 @@ def create_bugs_based_on_report_date(bugs):
     return bug_dates
 
 
+def get_time_epoch(datetime):
+    return time.mktime(datetime.timetuple())
+
+
+def bz_days_to_states(bzapi, bz_id, creation_time):
+    """This function returns a dictionary with the days from the bug creation
+    to the different states listed on 'BUG_STATES'. If it never got to a state
+    it won't appear in the dictionary either.
+    """
+    creation_time = get_time_epoch(creation_time)
+    bz_states_dict = {}
+    bz_dates = {}
+    history = bzapi.bugs_history_raw(bz_id)['bugs'][0]['history']
+    for event in history:
+        for change in event['changes']:
+            added = change['added'].lower()
+            if added in BUG_STATES:
+                bz_dates[added] = event['when']
+                time_event = get_time_epoch(event['when'])
+                bz_states_dict[added] = int(
+                    (time_event - creation_time)/SEC_PER_DAY)
+    return bz_states_dict
+
+
 def main():
     args = get_opts()
 
@@ -184,22 +214,38 @@ def main():
         print(e)
         sys.exit(1)
 
-    #bzapi.bug_autorefresh = True
+    # bzapi.bug_autorefresh = True
 
-    start_date = datetime.datetime.strptime(args.startdate, '%Y-%m-%d')
-    end_date = start_date + datetime.timedelta(weeks=args.weeks)
+    if args.bugzilla:
+        try:
+            creation_time = bzapi.getbug(args.bugzilla).creation_time
+            bz_states_dict = bz_days_to_states(bzapi, args.bugzilla,
+                                               creation_time)
+        except Exception as e:
+            if hasattr(e, "faultString"):
+                print(e.faultString)
+            else:
+                print(e)
+            sys.exit(1)
+        for a, b in bz_states_dict.items():
+            if a != 'created':
+                print("Days to %s: %s" % (a, b))
 
-    query = QUERY.copy()
-    query.update({
-        'chfieldfrom': str(start_date.date()),
-        'chfieldto': str(end_date.date())})
+    else:
+        start_date = datetime.datetime.strptime(args.startdate, '%Y-%m-%d')
+        end_date = start_date + datetime.timedelta(weeks=args.weeks)
 
-    bugs = create_bugs_based_on_report_date(bzapi.query(query))
+        query = QUERY.copy()
+        query.update({
+            'chfieldfrom': str(start_date.date()),
+            'chfieldto': str(end_date.date())})
 
-    reports = process_bugs(args.format, bugs)
+        bugs = create_bugs_based_on_report_date(bzapi.query(query))
 
-    for report in reports:
-        report.print()
+        reports = process_bugs(args.format, bugs)
+
+        for report in reports:
+            report.print()
 
 
 if __name__ == "__main__":
